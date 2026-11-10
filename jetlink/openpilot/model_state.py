@@ -120,6 +120,8 @@ class Frame:
   seq: int | None = None
   sent: float = 0.0
   telemetry: bool = False
+  # whether its packed inputs carry a desire pulse
+  pulse: bool = False
 
 
 class JetlinkModelState:
@@ -174,7 +176,15 @@ class JetlinkModelState:
     self.packed = np.zeros(spec.packed_nelem, dtype=np.float32)
     self.npy = {k: self.packed[at].reshape(shape) for k, (at, shape) in spec.packed_layout.items()}
 
+    # the last desire the host was sent, which is what a rising edge is against
     self.prev_desire = np.zeros(face.desire_len, dtype=np.float32)
+    # this frame's desire as modeld gave it, until send() knows the frame went
+    self._desire_in = np.zeros(face.desire_len, dtype=np.float32)
+    # did the last frame carry a desire pulse and go to the host? What a
+    # caller that asks once (a turn request) waits for before it stops asking
+    self.desire_sent = False
+    # the newest pulse sent: its seq and frame, for desire_trace
+    self._pulse: tuple[int, int] | None = None
     self.parser = face.parser()
     # the camera buffers modeld hands over, whatever the graph calls its inputs
     self.vision_input_names = ['img', 'big_img']
@@ -232,15 +242,18 @@ class JetlinkModelState:
     # Under whichever name the loop keyed it: stock modeld's desire_pulse, or a modeld_v2 bundle's own
     desire = inputs[next(k for k in inputs if k.startswith('desire'))]
     desire[0] = 0
+    # Against the last desire the host was sent, not the last one seen: a
+    # frame the link does not take (send) is not an edge the host has had, so
+    # a desire still asked for on the next frame is still a pulse then
     self.npy['desire'][:] = np.where(desire - self.prev_desire > .99, desire, 0)
-    self.prev_desire[:] = desire
+    self._desire_in[:] = desire
     self.npy['traffic_convention'][:] = inputs['traffic_convention']
     self.npy['action_t'][:] = inputs['action_t']
 
     # free again once infer_begin returns: the gadget's io_submit and the
     # cable's sendmsg have copied it by then, before the next warp writes it
     self.warp.wait()
-    self._frame = Frame(t0, t1, time.perf_counter())
+    self._frame = Frame(t0, t1, time.perf_counter(), pulse=bool(self.npy['desire'].any()))
 
   def send(self, want_telemetry: bool = False) -> None:
     """The prepared frame to the host. It asks for the server's telemetry
@@ -261,8 +274,13 @@ class JetlinkModelState:
       self._log.warning("jetlink: frame %d send failed: %s", self._frame_id, getattr(self.client.t, 'last_send', {}))
       raise
     frame.sent = time.perf_counter()
-    if frame.seq is not None:
+    sent = frame.seq is not None
+    if sent:
       self._need_reset = False
+      self.prev_desire[:] = self._desire_in
+    self.desire_sent = sent and frame.pulse
+    if self.desire_sent:
+      self._pulse = (frame.seq, self._frame_id)
 
   def end(self, after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray]:
     """The sent frame's output, as modeld blocks on a chestnut's, but not past
@@ -315,6 +333,19 @@ class JetlinkModelState:
                         gpu_us / 1e3, queue_us / 1e3, total_us / 1e3, receive.get('prepare', 0.0) * 1e3,
                         receive.get('read_wait', 0.0) * 1e3, receive.get('handoff', 0.0) * 1e3, cable)
     return outputs
+
+  @property
+  def desire_trace(self) -> dict | None:
+    """The newest desire pulse sent to the host and what became of its frame:
+    {seq, frame, fate}, fate as JetlinkClient.fate has it ('flight' until the
+    reply is read, then 'answered', or 'lost'). None before the first. Sent is
+    not answered, and answered is the host having run the frame, not the
+    policy having acted on it: that shows only in what the model plans."""
+    if self._pulse is None:
+      return None
+    seq, frame = self._pulse
+    fate = getattr(self.client, 'fate', None)
+    return {'seq': seq, 'frame': frame, 'fate': fate(seq) if fate is not None else 'unknown'}
 
   def run(self, bufs: dict, transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray], after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray]:

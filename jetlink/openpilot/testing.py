@@ -311,10 +311,13 @@ class FakeJoinedModel:
     self.constants = constants
     self.LAT_SMOOTH_SECONDS = self.LONG_SMOOTH_SECONDS = self.frame_drop_ratio = self.lat_delay = 0.0
     self.runs, self.closed = 0, False
+    # the last frame's desire pulse reached the model that ran it; no large model's trace
+    self.desire_sent, self.desire_trace = True, None
 
   def hand_over(self, state: str = 'running') -> None:
     self.handovers += 1
     self.big_model_state = state
+    self.desire_sent = False   # a handover frame goes without its desire
 
   def run(self, bufs, transforms, inputs, after_enqueue=None):
     self.runs += 1

@@ -188,6 +188,7 @@ class SmallModel(Protocol):
   numpy_inputs: Any
   lat_delay: float
   PLANPLUS_CONTROL: float
+  desire_sent: bool                 # did the last frame carry a desire pulse; one that does not say ran what it was given
 
   def run(self, bufs: Any, transforms: Any, inputs: Any, after_enqueue: Callable[[], None] | None = None) -> Any:
     """One frame's outputs, as modeld's ModelState.run."""
@@ -200,6 +201,8 @@ class JoinedModel(Protocol):
   follow the model that drives, like any name it does not define, so over a
   stock modeld's small model they are there only while the large one drives."""
   handovers: int                    # moves on every swap and hand-back; modeld forgives that frame's drops
+  desire_sent: bool                 # did the last frame's desire pulse reach the model that ran it (withheld on a handover)
+  desire_trace: Any                 # the large model's newest pulse, {seq, frame, fate}, or None
   big_model_state: str              # one of STATES
   chestnut: bool                    # modelV2.big
   get_action_from_model: Callable[..., Any]
@@ -238,7 +241,7 @@ class FrameWarp(Protocol):
 # asks for these, as typing has no optional member
 OPTIONAL: dict[type, tuple[str, ...]] = {
   ModelSide: ('small_reset', 'model_warp'),
-  SmallModel: ('desire_key', 'numpy_inputs', 'lat_delay', 'PLANPLUS_CONTROL'),
+  SmallModel: ('desire_key', 'numpy_inputs', 'lat_delay', 'PLANPLUS_CONTROL', 'desire_sent'),
   JoinedModel: ('get_action_from_model', 'constants', 'LAT_SMOOTH_SECONDS', 'LONG_SMOOTH_SECONDS', 'lat_delay'),
 }
 

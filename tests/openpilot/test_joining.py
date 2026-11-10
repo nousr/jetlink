@@ -758,6 +758,100 @@ class WaitingTest(JoiningBase):
     self.assertEqual(self._run(s), {'from': 'big'})
 
 
+class DesireHandoverTest(JoiningBase):
+  """A desire is asked of the model that was driving when it was asked. The
+  first frame another model runs goes without it, and desire_sent says so:
+  a turn asked for once must not land on a model that never heard it asked."""
+
+  SLOT = 1
+
+  def setUp(self):
+    super().setUp()
+    for model in (self.small, self.big):
+      model.seen = []
+      model.desire_sent = True
+      run = model.run
+      model.run = lambda bufs, transforms, inputs, after_enqueue=None, model=model, run=run: (
+        model.seen.append(inputs), run(bufs, transforms, inputs, after_enqueue))[1]
+    self.reset = mock.Mock()
+    self.s = self._make(self.small, self._connect, self._build, reset_small=self.reset)
+    self.addCleanup(self._close, self.s)
+    self._wait_joined(self.s)
+    self.s.in_control = False
+    self.assertEqual(self.frame(0), {'from': 'big'})   # the swap
+    self.s.in_control = True
+
+  def inputs(self, level):
+    desire = np.zeros(8, np.float32)
+    desire[self.SLOT] = level
+    return {'desire_pulse': desire, 'traffic_convention': np.array([1, 0], np.float32)}
+
+  def frame(self, level):
+    self.given = self.inputs(level)
+    return self.s.run({}, {}, self.given)
+
+  def test_the_model_that_drives_gets_the_frame_as_it_was_given(self):
+    self.assertEqual(self.frame(1), {'from': 'big'})
+    self.assertIs(self.big.seen[-1], self.given)
+    self.assertTrue(self.s.desire_sent)
+
+  def test_the_swap_frame_itself_went_without_a_desire(self):
+    s = self._make(self.small, self._connect, self._build)
+    self.addCleanup(self._close, s)
+    self._wait_joined(s)
+    s.in_control = True
+    s.run({}, {}, self.inputs(0))
+    s.in_control = False
+    given = self.inputs(1)
+    self.assertEqual(s.run({}, {}, given), {'from': 'big'})
+    self.assertFalse(self.big.seen[-1]['desire_pulse'].any())
+    self.assertFalse(s.desire_sent)
+    self.assertTrue(given['desire_pulse'][self.SLOT], "modeld's own array is left as it was")
+
+  def test_a_frame_the_large_model_fails_reaches_the_small_one_without_its_desire(self):
+    self.big.raises = RuntimeError('link gone')
+    handovers = self.s.handovers
+    self.assertEqual(self.frame(1), {'from': 'small'})
+    self.assertTrue(self.big.seen[-1]['desire_pulse'][self.SLOT], 'the model that was asked')
+    self.assertFalse(self.small.seen[-1]['desire_pulse'].any(), 'the one that was not')
+    np.testing.assert_array_equal(self.small.seen[-1]['traffic_convention'], self.given['traffic_convention'])
+    self.assertFalse(self.s.desire_sent)
+    self.assertNotEqual(self.s.handovers, handovers, 'and whoever asked can read that it changed')
+
+  def test_a_lag_hand_back_frame_goes_without_its_desire(self):
+    self.big.behind = 'held 5 frames in a row'
+    self.assertEqual(self.frame(0), {'from': 'big'})
+    self.big.behind = None
+    handovers = self.s.handovers
+    self.assertEqual(self.frame(1), {'from': 'small'})
+    self.assertFalse(self.small.seen[-1]['desire_pulse'].any())
+    self.assertFalse(self.s.desire_sent)
+    self.assertNotEqual(self.s.handovers, handovers)
+
+  def test_a_level_still_held_reaches_the_new_model_on_its_next_frame(self):
+    # a lane change is held as a level: one frame late, not lost
+    self.big.raises = RuntimeError('link gone')
+    self.frame(1)
+    self.assertEqual(self.frame(1), {'from': 'small'})
+    self.assertIs(self.small.seen[-1], self.given)
+    self.assertTrue(self.s.desire_sent)
+
+  def test_a_small_model_that_does_not_say_is_taken_to_have_run_its_frame(self):
+    self.big.raises = RuntimeError('link gone')
+    self.frame(0)
+    del self.small.desire_sent
+    self.frame(1)
+    self.assertTrue(self.s.desire_sent)
+
+  def test_the_trace_is_the_large_models_and_none_over_the_small_one(self):
+    self.big.desire_trace = {'seq': 7, 'frame': 7, 'fate': 'flight'}
+    self.frame(0)
+    self.assertEqual(self.s.desire_trace, self.big.desire_trace)
+    self.big.raises = RuntimeError('link gone')
+    self.frame(0)
+    self.assertIsNone(self.s.desire_trace)
+
+
 class LagTest(JoiningBase):
   """A large model that answers, but late, is handed back as if it were lost:
   when it says it held too many frames (behind), or when modeld drops too
@@ -1158,15 +1252,20 @@ class ModeldV2FaceTest(JoiningBase):
     self.assertIs(s.numpy_inputs, self.small.numpy_inputs)
     self._wait_joined(s)
     s.in_control = False
-    inputs = {'desire': object(), 'action_t': 1}
+    desire = np.ones(8, np.float32)
+    inputs = {'desire': desire, 'action_t': 1}
+    # the swap's own frame goes without the desire (DesireHandoverTest); the next is as built
+    s.run({}, {}, inputs)
     self.assertEqual(s.run({}, {}, inputs), {'from': 'big'})
     self.assertIs(self.big.seen_inputs, inputs)
     self.assertEqual(s.desire_key, 'desire')
     self.assertIs(s.numpy_inputs, self.small.numpy_inputs)
-    # and back on a demote, the same frame
+    # and back on a demote, the same frame but for its desire, which was asked of the large model
     self.big.raises = RuntimeError('link died')
     self.assertEqual(s.run({}, {}, inputs), {'from': 'small'})
-    self.assertIs(self.small.seen_inputs, inputs)
+    self.assertEqual(self.small.seen_inputs['action_t'], 1)
+    self.assertFalse(self.small.seen_inputs['desire'].any())
+    self.assertTrue(desire.all(), "modeld's array is not written")
 
 
 class ProtocolTest(JoiningBase):

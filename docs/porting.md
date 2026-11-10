@@ -231,6 +231,17 @@ hand-back stalls a frame or two, so those drops restart the filter's warmup:
       run_count = 0
 ```
 
+The desire is a pulse on its rising edge, taken against the last desire the
+host was sent: a frame the link did not take is not an edge the host has had.
+`model.desire_sent` says, after `run()`, whether the frame carried a pulse to
+the model that ran it, and `model.desire_trace` what became of the large
+model's newest one (`{seq, frame, fate}`: `flight`, then `answered` or
+`lost`). The first frame another model runs, a swap, a hand-back or the
+fallback inside a frame, goes without its desire. A desire held as a level (a
+lane change) reaches the new model one frame later; a fork that asks for
+something once reads `desire_sent` to know whether to ask again and
+`handed_over` to know not to.
+
 `HOOKS.state(model)` is the big model's state, one of `STATES`. Publish it if
 your fork has a message for it (zoompilot: `modelDataV2SP.acceleratorState`);
 without one, `HOOKS.runtime()` carries it.

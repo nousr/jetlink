@@ -50,8 +50,9 @@ MODELD = {
 SIDES = {'StatusSide': READERS, 'WorkerSide': WORKER, 'ModelSide': MODELD, 'Openpilot': MODELD}
 # what modeld hands attach, and what it reads off and writes onto the result
 RUN = '(bufs: Any, transforms: Any, inputs: Any, after_enqueue: Callable[[], None] | None = None) -> Any'
-SMALL = {'desire_key': None, 'numpy_inputs': None, 'lat_delay': None, 'PLANPLUS_CONTROL': None, 'run': RUN}
-JOINED = {'handovers': None, 'big_model_state': None, 'chestnut': None, 'get_action_from_model': None,
+SMALL = {'desire_key': None, 'numpy_inputs': None, 'lat_delay': None, 'PLANPLUS_CONTROL': None, 'desire_sent': None,
+         'run': RUN}
+JOINED = {'handovers': None, 'desire_sent': None, 'desire_trace': None, 'big_model_state': None, 'chestnut': None, 'get_action_from_model': None,
           'constants': None, 'LAT_SMOOTH_SECONDS': None, 'LONG_SMOOTH_SECONDS': None, 'frame_drop_ratio': None,
           'lat_delay': None, 'run': RUN, 'close': '() -> None'}
 # what an adapter's model_warp returns
@@ -59,7 +60,7 @@ WARP = {'output': None, 'start': '(frame: int, big_frame: int, tfm: Any, big_tfm
 MODELS = {'SmallModel': SMALL, 'JoinedModel': JOINED, 'FrameWarp': WARP}
 # the members an implementation may lack: jetlink reads them with getattr and a fallback
 OPTIONAL = {'ModelSide': {'small_reset', 'model_warp'}, 'Openpilot': {'small_reset', 'model_warp'},
-            'SmallModel': {'desire_key', 'numpy_inputs', 'lat_delay', 'PLANPLUS_CONTROL'},
+            'SmallModel': {'desire_key', 'numpy_inputs', 'lat_delay', 'PLANPLUS_CONTROL', 'desire_sent'},
             'JoinedModel': {'get_action_from_model', 'constants', 'LAT_SMOOTH_SECONDS', 'LONG_SMOOTH_SECONDS', 'lat_delay'}}
 
 FIELDS = {

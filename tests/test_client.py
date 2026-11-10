@@ -299,6 +299,20 @@ class FramesAsDatagrams(FramesInFlight):
     self.assertEqual((self.client.frames_lost, self.client.waiting_for()), (1, 0.0))
     self.assertTrue(self.client.t.datagrams, 'a lost frame is a held one, nothing more')
 
+  def test_the_fate_of_a_frame_is_flight_then_answered_or_lost(self):
+    self.greet(**self.offer())
+    first = self.lose(1)
+    self.take_frame()   # the phone never got it whole
+    self.assertEqual(self.client.fate(first), 'flight')
+    self.assertIsNone(self.client.infer_end(first, hold=0.01))
+    second = self.lose(2)
+    seq, _ = self.take_frame()
+    self.assertEqual((self.client.fate(first), self.client.fate(second)), ('flight', 'flight'))
+    self.peer.send(P.Msg.INFER_RESP, seq, (reply(np.full(self.client.spec.reply_nelem, 2.0), frame_id=2),))
+    self.client.infer_end(second)
+    self.assertEqual((self.client.fate(first), self.client.fate(second)), ('lost', 'answered'))
+    self.assertEqual(self.client.fate(second + 100), 'lost', 'a seq never sent ran nowhere')
+
   def test_a_send_the_kernel_refuses_fails_the_link(self):
     # the phone's port is gone with its server, and the stream with it
     port = self.udp.getsockname()[1]

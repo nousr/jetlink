@@ -110,6 +110,9 @@ class JetlinkClient:
     # frames the server never answered this session, for the log: a lost
     # datagram is one, and to the caller a held frame like any late reply
     self.frames_lost = 0
+    # the seqs of the newest frames the server answered with an output, for
+    # fate(): a caller that sent something with a frame asks whether it ran
+    self._answered: deque[int] = deque(maxlen=64)
     # take a server's offer of frame datagrams (_take_datagrams); False keeps frames on the stream, for A/B runs
     self.allow_datagrams = True
 
@@ -573,7 +576,17 @@ class JetlinkClient:
                   receive['prepare'] * 1e3, receive['read_wait'] * 1e3, receive['handoff'] * 1e3,
                   gpu_us / 1e3, queue_us / 1e3, total_us / 1e3)
     self.last_output = _whole_output(self.spec, np.frombuffer(msg.payload, np.float32, n, P.INFER_RESP_SIZE), whole)
+    self._answered.append(msg.seq)
     return self.last_output
+
+  def fate(self, seq: int) -> str:
+    """What became of the frame sent as `seq`: 'flight' while its reply is
+    out, 'answered' once the server has run it and its output was read, and
+    'lost' for one that left flight any other way (never answered, answered
+    NOT_FINITE, or older than the answers remembered)."""
+    if any(f.seq == seq for f in self._in_flight):
+      return 'flight'
+    return 'answered' if seq in self._answered else 'lost'
 
   def infer(self, warped: np.ndarray, packed: np.ndarray, frame_id: int = 0,
             reset: bool = False, deadline: float | None = None,

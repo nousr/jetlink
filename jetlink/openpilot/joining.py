@@ -47,6 +47,8 @@ import os
 import threading
 import time
 
+import numpy as np
+
 from jetlink import protocol as P
 from jetlink.comma import gadget
 from jetlink.openpilot.model_state import JetlinkModelState
@@ -189,6 +191,10 @@ class JoiningModelState:
     self._announce = False
     # frames the small model has run since start
     self._small_frames = 0
+    # the model that ran the last frame, and whether this frame's desire was
+    # withheld because another runs it (_inputs_for)
+    self._ran = None
+    self._desire_withheld = False
     # whether the host had let go of the gadget when the last link was lost,
     # and whether this failure streak has already skipped a backoff for a replug
     self._host_left = False
@@ -250,6 +256,22 @@ class JoiningModelState:
     A count and not modelV2.big: a swap whose first frame fails and demotes in
     the same run() leaves `chestnut` as it was."""
     return self._handovers
+
+  @property
+  def desire_sent(self) -> bool:
+    """Did the last frame's desire pulse reach the model that ran it? False
+    for a frame whose desire was withheld (a handover, _inputs_for) and for
+    one the link did not take (JetlinkModelState.desire_sent). A model that
+    does not say, a fork's small one, ran its frame where it stands."""
+    if self._desire_withheld:
+      return False
+    return bool(getattr(self._active, 'desire_sent', True))
+
+  @property
+  def desire_trace(self) -> dict | None:
+    """The large model's newest desire pulse and what became of it
+    (JetlinkModelState.desire_trace); None while the small model drives."""
+    return getattr(self._active, 'desire_trace', None) if self._active is not self._small else None
 
   @property
   def frame_health(self) -> dict:
@@ -352,12 +374,27 @@ class JoiningModelState:
                         "the small model drives from this one", self._frame_drop_ratio * 100)
       self._demote(BEHIND)
     self._maybe_swap()
+    given, inputs = inputs, self._inputs_for(self._active, inputs)
     if self._active is self._small:
       self._small_frames += 1
       return self._small.run(bufs, transforms, inputs, after_enqueue)
-    return self._run_big(bufs, transforms, inputs, after_enqueue)
+    return self._run_big(bufs, transforms, inputs, after_enqueue, given)
 
-  def _run_big(self, bufs, transforms, inputs, after_enqueue):
+  def _inputs_for(self, model, inputs):
+    """The frame's inputs for the model about to run it. A desire is asked of
+    the model that was driving when it was asked: on the first frame another
+    model runs (a swap, a hand-back, the fallback inside a frame) it is
+    withheld, the frame goes without one, and desire_sent says so. A desire
+    held as a level (a lane change) is an edge again on the next frame, to
+    the model that now drives; one asked once (a turn) is not asked of a
+    model that never heard the question, and whoever asked reads handovers."""
+    changed, self._ran = self._ran is not None and model is not self._ran, model
+    self._desire_withheld = changed
+    if not changed:
+      return inputs
+    return {k: np.zeros_like(v) if k.startswith('desire') else v for k, v in inputs.items()}
+
+  def _run_big(self, bufs, transforms, inputs, after_enqueue, given=None):
     big = self._big
     started = time.monotonic()
     try:
@@ -370,7 +407,7 @@ class JoiningModelState:
       # re-run the frame rather than propagate: modeld's fallback is permanent,
       # this one is retryable. after_enqueue is dropped, the large model may
       # already have called it
-      result = self._small.run(bufs, transforms, inputs, None)
+      result = self._small.run(bufs, transforms, self._inputs_for(self._small, inputs if given is None else given), None)
       # all of it is one modeld frame, 42 to 107 ms measured with the small
       # model warm. The dropped camera frames are forgiven
       # (modeld sees the model change), but the log should say which part it was

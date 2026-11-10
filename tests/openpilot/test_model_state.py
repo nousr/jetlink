@@ -117,6 +117,9 @@ class FakeClient:
   def unanswered(self):
     return len(self._in_flight)
 
+  def fate(self, seq):
+    return 'flight' if seq in self._in_flight else 'answered'
+
 
 class FakeWarp:
   """warp.Warp as the model state uses it. `output` holds the warped frame
@@ -167,6 +170,94 @@ class ModelStateTest(unittest.TestCase):
                'action_t': np.array([0.1, 0.2], np.float32)})
       outs.append(state.run(*args, after_enqueue))
     return outs
+
+
+class TestDesire(ModelStateTest):
+  """The desire is a pulse on its rising edge, against what the host was last
+  sent: a frame the link does not take is not an edge the host has had. What a
+  caller that asks once needs to know is whether the frame carrying its pulse
+  went (desire_sent), and what became of it (desire_trace)."""
+
+  SLOT = 1
+
+  def run_desires(self, state, levels):
+    """One frame per entry of `levels`, the desire slot at that level. Each
+    frame's (pulse packed, desire_sent)."""
+    bufs = {k: SimpleNamespace(data=np.zeros(8, np.uint8)) for k in ('img', 'big_img')}
+    out = []
+    for level in levels:
+      desire = np.zeros(8, np.float32)
+      desire[self.SLOT] = level
+      state.run(bufs, {'img': np.eye(3), 'big_img': np.eye(3)},
+                {'desire_pulse': desire, 'traffic_convention': np.array([1, 0], np.float32),
+                 'action_t': np.array([0.1, 0.2], np.float32)})
+      out.append((bool(state.npy['desire'][self.SLOT]), state.desire_sent))
+    return out
+
+  def pulses_sent(self, client):
+    return [frame_id for _, packed, frame_id, _ in client.sent if packed[self.SLOT]]
+
+  def test_a_pulse_that_went_says_so_once(self):
+    client = FakeClient()
+    state = self.make(spec_for(STATEFUL), client)
+    self.assertEqual(self.run_desires(state, [0, 1, 1, 1, 0]),
+                     [(False, False), (True, True), (False, False), (False, False), (False, False)])
+    self.assertEqual(self.pulses_sent(client), [2])
+    self.assertEqual(state.desire_trace, {'seq': 2, 'frame': 2, 'fate': 'answered'})
+
+  def test_a_level_the_link_did_not_take_is_an_edge_on_the_next_frame(self):
+    client = FakeClient()
+    client.busy = {2}
+    state = self.make(spec_for(STATEFUL), client)
+    self.assertEqual(self.run_desires(state, [0, 1, 1, 1]),
+                     [(False, False), (True, False), (True, True), (False, False)])
+    self.assertEqual(self.pulses_sent(client), [3], 'once, on the first frame that went')
+
+  def test_one_frame_of_desire_on_a_refused_frame_is_not_sent_later_by_itself(self):
+    # the caller that asks for one frame reads desire_sent and asks again, or
+    # does not: nothing here holds a request it cannot know is still wanted
+    client = FakeClient()
+    client.busy = {2}
+    state = self.make(spec_for(STATEFUL), client)
+    self.assertEqual(self.run_desires(state, [0, 1, 0, 0]),
+                     [(False, False), (True, False), (False, False), (False, False)])
+    self.assertEqual(self.pulses_sent(client), [])
+    self.assertIsNone(state.desire_trace)
+
+  def test_asked_again_after_a_refusal_it_goes_once(self):
+    client = FakeClient()
+    client.busy = {2, 3}
+    state = self.make(spec_for(STATEFUL), client)
+    with mock.patch.object(model_state, 'HOLDS_IN_A_ROW', 99):
+      sent = self.run_desires(state, [0, 1, 1, 1, 0, 0])
+    self.assertEqual([s for _, s in sent], [False, False, False, True, False, False])
+    self.assertEqual(self.pulses_sent(client), [4])
+
+  def test_the_trace_says_sent_before_it_says_answered(self):
+    client = FakeClient()
+    state = self.make(spec_for(STATEFUL), client)
+    self.run_desires(state, [0])
+    client.late = {2}
+    self.assertEqual(self.run_desires(state, [1]), [(True, True)])
+    self.assertTrue(state.held, 'its reply is late: the frame before is published again')
+    self.assertEqual(state.desire_trace, {'seq': 2, 'frame': 2, 'fate': 'flight'})
+    client.late = set()
+    self.run_desires(state, [0])   # the next frame's drain reads the late reply
+    self.assertEqual(state.desire_trace, {'seq': 2, 'frame': 2, 'fate': 'answered'})
+    self.assertEqual(self.pulses_sent(client), [2])
+
+  def test_a_frame_without_a_pulse_never_says_sent(self):
+    client = FakeClient()
+    state = self.make(spec_for(STATEFUL), client)
+    self.assertEqual(self.run_desires(state, [0, 0, 0]), [(False, False)] * 3)
+
+  def test_a_fresh_state_does_not_resend_a_level_it_never_saw_rise_as_sent(self):
+    # what a swap builds: prev_desire zeroed, so a level still held is an edge
+    # to it. Whether that is wanted is the caller's (JoiningModelState withholds
+    # the desire on a handover frame; a turn request is cancelled by handovers)
+    client = FakeClient()
+    state = self.make(spec_for(STATEFUL), client)
+    self.assertEqual(self.run_desires(state, [1]), [(True, True)])
 
 
 class TestWire(ModelStateTest):
