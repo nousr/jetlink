@@ -15,6 +15,7 @@ import csv
 import importlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -29,6 +30,21 @@ import numpy as np
 MODELD = {'stock': 'openpilot.selfdrive.modeld.modeld', 'tinygrad': 'openpilot.sunnypilot.modeld_v2.modeld'}
 
 
+def wait_for_owner(owner, live, stopped, configured, timeout=60):
+  """Wait before modeld's one-time prepare(), watching the real offroad flag."""
+  deadline = time.monotonic() + timeout
+  while True:
+    if stopped() or not live.get_bool('IsOffroad'):
+      raise RuntimeError('bench stopped or real ignition changed during USB setup')
+    if owner.poll() is not None:
+      raise RuntimeError('USB owner exited; inspect jetlinkd.log and owner.log')
+    if configured():
+      return
+    if time.monotonic() >= deadline:
+      raise TimeoutError('USB gadget was not configured within the setup timeout')
+    time.sleep(0.1)
+
+
 def main():
   from openpilot.cereal import messaging
   from openpilot.common.basedir import BASEDIR
@@ -41,6 +57,9 @@ def main():
   parser.add_argument('--seconds', type=float, default=180)
   parser.add_argument('--output', type=Path, required=True)
   parser.add_argument('--small', action='store_true')
+  parser.add_argument('--start-owner', action='store_true', help='run the USB owner under the same private params as modeld')
+  parser.add_argument('--model-sha256', help='pin a model by its full ONNX SHA-256 in private params')
+  parser.add_argument('--model-name', default='Bench model')
   parser.add_argument('--engaged-until', type=float, default=0.0,
                       help='fake engaged controls for this many seconds, so the join has to wait for a window')
   parser.add_argument('--write-chunk', type=int, choices=[8192, 16384],
@@ -56,6 +75,10 @@ def main():
   args.output = args.output.resolve()
   if not np.isfinite(args.seconds) or args.seconds <= 0:
     parser.error('--seconds must be positive')
+  if args.start_owner and (os.environ.get('OPENPILOT_PREFIX') or os.environ.get('PARAMS_ROOT')):
+    parser.error('--start-owner must begin with the real device params, without OPENPILOT_PREFIX or PARAMS_ROOT')
+  if args.model_sha256 and (not KEYS.big_model or not re.fullmatch('[0-9a-f]{64}', args.model_sha256)):
+    parser.error('--model-sha256 requires 64 lowercase hex digits and an adapter with a big_model key')
   live = Params()
   if not live.get_bool('IsOffroad'):
     raise SystemExit('bench requires the real device to remain offroad')
@@ -111,13 +134,17 @@ def main():
         params.put(key, value, block=True)
     params.put('CarParams', saved['CarParamsPersistent'], block=True)
     params.put(KEYS.link, 0 if args.small else 1, block=True)   # Jetlink off, or USB
+    if args.model_sha256:
+      params.put(KEYS.big_model, {'sha256': args.model_sha256, 'displayName': args.model_name}, block=True)
+    if args.start_owner:
+      params.put_bool(KEYS.offroad, True, block=True)
     pm = messaging.PubMaster([*IN_CONTROL, 'deviceState', 'extrinsicsCalibration'])
     sm = messaging.SubMaster(['modelV2'])
     hooks = fork.hooks()
     calibration = None
     if saved['CalibrationParams'] is not None:
       calibration = messaging.log_from_bytes(saved['CalibrationParams'])
-    child_env = dict(os.environ, LOG_ROOT=str(args.output / 'recordings'))
+    child_env = dict(os.environ, LOG_ROOT=str(args.output / 'recordings'), JETLINK_BENCH_OUTPUT=str(args.output))
     if args.record:
       params.put('RecordFront', True, block=True)
     print(f'isolated prefix={prefix.prefix} output={args.output} modeld={args.modeld}', flush=True)
@@ -134,6 +161,14 @@ def main():
       commands = [
         ('camerad', [str(Path(BASEDIR) / 'openpilot/system/camerad/camerad')]),
         ('modeld', model_command)]
+      if args.start_owner and not args.small:
+        from jetlink.comma import gadget
+        owner_log = (args.output / 'jetlinkd.log').open('w')
+        files.append(owner_log)
+        owner = subprocess.Popen([sys.executable, '-m', args.adapter], cwd=BASEDIR, env=child_env,
+                                 stdout=owner_log, stderr=subprocess.STDOUT)
+        children.append(owner)
+        wait_for_owner(owner, live, lambda: stop, gadget.link_configured)
       if args.record:
         # AGNOS otherwise writes Python logs to the live /data/log even with
         # an isolated prefix. Keep those files with the recording artifacts.
@@ -221,6 +256,10 @@ def main():
       failure = error
     finally:
       stopping = time.monotonic()
+      if args.start_owner:
+        # Let the owner's shutdown restore USB/VM tuning it applied. Keep
+        # the private params alive until the owner and its worker exit.
+        params.put(KEYS.link, 0, block=True)
       for child in reversed(children):
         if child.poll() is None:
           child.send_signal(signal.SIGINT)
