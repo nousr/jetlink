@@ -252,6 +252,20 @@ class JoiningModelState:
     return self._handovers
 
   @property
+  def frame_health(self) -> dict:
+    """Snapshot after run(), for a fork's per-frame engagement checks.
+
+    Unlike the one-second runtime file, this describes the output being
+    published now. A held output retains its original last-output timestamp.
+    """
+    big = self._big
+    active = big is not None and self._active is big and not self._loading
+    return {'active': active, 'held': bool(getattr(big, 'held', False)) if active else False,
+            'lastOutputMonoTime': int(self._output_at * 1e9) if active else 0,
+            'generation': self._handovers, 'sessionId': os.getpid(),
+            'sha256': getattr(getattr(big, 'spec', None), 'sha256', '') or ''}
+
+  @property
   def big_model_state(self) -> str:
     """modelDataV2SP.acceleratorState, one of its enum names (STATES)."""
     if self._stop.is_set():

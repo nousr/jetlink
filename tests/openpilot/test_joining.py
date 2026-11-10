@@ -183,6 +183,26 @@ class JoiningTest(JoiningBase):
     self.assertFalse(s.chestnut)
     self.assertIsNone(s.client)
 
+  def test_frame_health_distinguishes_fresh_held_and_local_outputs(self):
+    s = self._driving(False)
+    fresh = s.frame_health
+    self.assertTrue(fresh['active'])
+    self.assertFalse(fresh['held'])
+    self.assertGreater(fresh['lastOutputMonoTime'], 0)
+    self.assertGreater(fresh['sessionId'], 0)
+    self.big.held = True
+    self._run(s)
+    held = s.frame_health
+    self.assertTrue(held['held'])
+    self.assertEqual(held['lastOutputMonoTime'], fresh['lastOutputMonoTime'])
+    self.big.held = False
+    self._run(s)
+    self.assertGreater(s.frame_health['lastOutputMonoTime'], fresh['lastOutputMonoTime'])
+    s._active = self.small
+    self.assertFalse(s.frame_health['active'])
+    self.assertFalse(s.frame_health['held'])
+    self.assertEqual(s.frame_health['lastOutputMonoTime'], 0)
+
   def test_does_not_swap_while_engaged(self):
     # stopped or moving: even stopped, longitudinal control can hold the brake
     # or request motion, so the window is modeld's in_control and nothing else
