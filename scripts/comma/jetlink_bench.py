@@ -124,7 +124,8 @@ def main():
 
   signal.signal(signal.SIGTERM, stop_requested)
   signal.signal(signal.SIGINT, stop_requested)
-  children, files, rows = [], [], []
+  children, files, rows, driver_rows = [], [], [], []
+  monitoring_messages = monitoring_valid = 0
   failure = None
   # Keep artifacts under the explicit output directory; no live Params writes.
   with OpenpilotPrefix() as prefix:
@@ -139,7 +140,7 @@ def main():
     if args.start_owner:
       params.put_bool(KEYS.offroad, True, block=True)
     pm = messaging.PubMaster([*IN_CONTROL, 'deviceState', 'extrinsicsCalibration'])
-    sm = messaging.SubMaster(['modelV2'])
+    sm = messaging.SubMaster(['modelV2'] + (['driverStateV2', 'driverMonitoringState'] if args.record else []))
     hooks = fork.hooks()
     calibration = None
     if saved['CalibrationParams'] is not None:
@@ -180,6 +181,7 @@ def main():
           ('loggerd', [str(Path(BASEDIR) / 'openpilot/system/loggerd/loggerd')]),
           ('encoderd', [str(Path(BASEDIR) / 'openpilot/system/loggerd/encoderd')]),
           ('dmonitoringmodeld', [sys.executable, '-m', 'openpilot.selfdrive.modeld.dmonitoringmodeld']),
+          ('dmonitoringd', [sys.executable, '-m', 'openpilot.selfdrive.monitoring.dmonitoringd']),
         ])
       for name, command in commands:
         log = (args.output / f'{name}.log').open('w')
@@ -229,6 +231,13 @@ def main():
             message.logMonoTime = time.monotonic_ns()
             pm.send('extrinsicsCalibration', message)
           sm.update(0)
+          if args.record and sm.updated['driverStateV2']:
+            driver = sm['driverStateV2']
+            driver_rows.append((time.monotonic() - start, driver.frameId, int(sm.valid['driverStateV2']),
+                                driver.modelExecutionTime * 1000, driver.gpuExecutionTime * 1000))
+          if args.record and sm.updated['driverMonitoringState']:
+            monitoring_messages += 1
+            monitoring_valid += int(sm.valid['driverMonitoringState'])
           if sm.updated['modelV2']:
             model = sm['modelV2']
             if time.monotonic() - runtime_at >= 1.0:   # modeld rewrites its record once a second
@@ -293,6 +302,15 @@ def main():
                         'lagging_frames': int((values[:, 5] > 1).sum()), 'invalid_frames': int((values[:, 3] == 0).sum()),
                         'states': sorted({row[7] for row in subset})}
   if args.record:
+    with (args.output / 'driver-frames.csv').open('w') as stream:
+      writer = csv.writer(stream)
+      writer.writerow(['elapsed_s', 'frame_id', 'valid', 'exec_ms', 'gpu_ms'])
+      writer.writerows(driver_rows)
+    summary['driver_monitoring'] = {
+      'model_frames': len(driver_rows), 'valid_model_frames': sum(r[2] for r in driver_rows),
+      'policy_messages': monitoring_messages, 'valid_policy_messages': monitoring_valid,
+      'model_exec_p50_p99_max_ms': np.percentile([r[3] for r in driver_rows], [50, 99, 100]).tolist() if driver_rows else None,
+    }
     segments = sorted((args.output / 'recordings').glob('*--*'))
     complete = [p.name for p in segments if all((p / name).exists() and (p / name).stat().st_size > 0
                                                for name in ('rlog.zst', 'fcamera.hevc', 'ecamera.hevc', 'dcamera.hevc'))]
@@ -301,6 +319,8 @@ def main():
   print(json.dumps(summary, indent=2), flush=True)
   if failure is not None:
     raise failure
+  if args.record and (not any(r[2] for r in driver_rows) or not monitoring_valid):
+    raise SystemExit('recording workload did not produce valid driver model and monitoring policy messages')
   if args.record and not summary['recording']['complete_segments']:
     raise SystemExit('recording workload did not produce logs and all three camera files')
   if args.record and args.seconds >= 150 and len(summary['recording']['complete_segments']) < 2:
